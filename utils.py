@@ -13,7 +13,7 @@ import cv2
 import matplotlib.pyplot as plt
 from PIL import Image
 import torchvision.models as models
-from torchvision.models.segmentation import segmentation
+import torchvision.models.segmentation as segmentation
 
 # -----------------------------
 # Section 1: Utility Functions
