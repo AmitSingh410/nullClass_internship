@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import torchvision.models as models
 import torchvision.models.segmentation as segmentation
+from segment_anything import sam_model_registry, SamPredictor
 
 # -----------------------------
 # Section 1: Utility Functions
@@ -549,3 +550,43 @@ def evaluate_model(model, test_loader, device):
             )
             if i == 10:
                 break
+
+def sam_targeted_colorization(
+    image_path,
+    model,
+    point_coords,
+    sam_checkpoint_path="sam_vit_h.pth",
+    model_type="vit_h",
+    output_prefix="sam_output"
+):
+    device=next(model.parameters()).device
+    
+    # Load and preprocess input image
+    image_bgr=cv2.imread(image_path)
+    image_rgb=cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    pil_img=Image.fromarray(image_rgb)
+    transform=transforms.Compose([
+        transforms.Resize((256,256)),
+        transforms.ToTensor()
+    ])
+    img_tensor=transform(pil_img).unsqueeze(0).to(device)
+
+    # Convert to grayscale with CLAHE
+    gray_tensor=rgb_to_gray_with_clahe(img_tensor)
+    
+    # Predict ab channels
+    model.eval()
+    with torch.no_grad():
+        pred_ab=model(gray_tensor)
+        lab_tensor=torch.cat([gray_tensor,torch.clamp(pred_ab,-1.0,1.0)],dim=1)
+        color_tensor=lab_to_rgb_torch(lab_tensor).to(device)
+
+    # Load SAM and get mask
+    sam=sam_model_registry[model_type](checkpoint=sam_checkpoint_path).to(device)
+    predictor=SamPredictor(sam)
+    predictor.set_image(image_rgb)
+    
+    input_point=np.array([point_coords])
+    input_label=np.array([1]) 
+     
+
