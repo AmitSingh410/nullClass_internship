@@ -552,7 +552,6 @@ def evaluate_model(model, test_loader, device):
                 break
 
 def sam_targeted_colorization(
-<<<<<<< HEAD
         image_path,
         model,
         point_coords,
@@ -566,20 +565,6 @@ def sam_targeted_colorization(
     # Load and preprocess input image
     image_bgr = cv2.imread(image_path)
     image_rgb= cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-=======
-    image_path,
-    model,
-    point_coords,
-    sam_checkpoint_path="sam_vit_h.pth",
-    model_type="vit_h",
-    output_prefix="sam_output"
-):
-    device=next(model.parameters()).device
-    
-    # Load and preprocess input image
-    image_bgr=cv2.imread(image_path)
-    image_rgb=cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
->>>>>>> b2d24333b183cf37eb82886f87268839fb91e55d
     pil_img=Image.fromarray(image_rgb)
     transform=transforms.Compose([
         transforms.Resize((256,256)),
@@ -587,7 +572,6 @@ def sam_targeted_colorization(
     ])
     img_tensor=transform(pil_img).unsqueeze(0).to(device)
 
-<<<<<<< HEAD
     # Convert to grayscale
     gray_tensor = rgb_to_gray_with_clahe(img_tensor)
 
@@ -637,24 +621,3 @@ def sam_targeted_colorization(
     print(f"✅ Saved SAM mask overlay: {overlay_path}")
 
     return output_path 
-=======
-    # Convert to grayscale with CLAHE
-    gray_tensor=rgb_to_gray_with_clahe(img_tensor)
-    
-    # Predict ab channels
-    model.eval()
-    with torch.no_grad():
-        pred_ab=model(gray_tensor)
-        lab_tensor=torch.cat([gray_tensor,torch.clamp(pred_ab,-1.0,1.0)],dim=1)
-        color_tensor=lab_to_rgb_torch(lab_tensor).to(device)
-
-    # Load SAM and get mask
-    sam=sam_model_registry[model_type](checkpoint=sam_checkpoint_path).to(device)
-    predictor=SamPredictor(sam)
-    predictor.set_image(image_rgb)
-    
-    input_point=np.array([point_coords])
-    input_label=np.array([1]) 
-     
-
->>>>>>> b2d24333b183cf37eb82886f87268839fb91e55d
