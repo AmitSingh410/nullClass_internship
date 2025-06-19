@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import torchvision.models as models
 import torchvision.models.segmentation as segmentation
+from segment_anything import sam_model_registry, SamPredictor
 
 # -----------------------------
 # Section 1: Utility Functions
@@ -549,3 +550,74 @@ def evaluate_model(model, test_loader, device):
             )
             if i == 10:
                 break
+
+def sam_targeted_colorization(
+        image_path,
+        model,
+        point_coords,
+        sam_checkpoint_path="segment-anything/checkpoints/sam_vit_h_4b8939.pth",
+        model_type="vit_h",
+        output_prefix="sam_output"
+):
+    
+    device = next(model.parameters()).device
+
+    # Load and preprocess input image
+    image_bgr = cv2.imread(image_path)
+    image_rgb= cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    pil_img=Image.fromarray(image_rgb)
+    transform=transforms.Compose([
+        transforms.Resize((256,256)),
+        transforms.ToTensor()
+    ])
+    img_tensor=transform(pil_img).unsqueeze(0).to(device)
+
+    # Convert to grayscale
+    gray_tensor = rgb_to_gray_with_clahe(img_tensor)
+
+    # Predict ab channels
+    model.eval()
+    with torch.no_grad():
+        pred_ab = model(gray_tensor)
+        lab_tensor= torch.cat([gray_tensor, torch.clamp(pred_ab, -1.0, 1.0)], dim=1)
+        color_tensor = lab_to_rgb_torch(lab_tensor).to(device)
+
+    # Load SAM and get mask 
+    sam=sam_model_registry[model_type](checkpoint=sam_checkpoint_path).to(device)
+    predictor=SamPredictor(sam)
+    predictor.set_image(image_rgb)
+
+    input_point = np.array([point_coords])
+    input_label = np.array([1])  # 1 for foreground
+
+    masks,scores, _ = predictor.predict(
+        point_coords=input_point,
+        point_labels=input_label,
+        multimask_output=True
+    )
+    selected_mask=masks[np.argmax(scores)]
+
+    # Resize mask to match model input
+    mask_tensor=torch.from_numpy(selected_mask).unsqueeze(0).unsqueeze(0).to(device)
+    if mask_tensor.shape[-2:]!=gray_tensor.shape[-2:]:
+        mask_tensor=F.interpolate(mask_tensor.float(),size=gray_tensor.shape[-2:],mode='nearest')
+
+    # Blend
+    gray_3ch=gray_tensor.repeat(1, 3, 1, 1)
+    final_tensor=torch.where(mask_tensor.bool(),color_tensor,gray_3ch)
+
+    # Save output 
+    to_pil= transforms.ToPILImage()
+    colorized_pil = to_pil(final_tensor.squeeze(0).cpu().clamp(0, 1))
+    output_path = f"{output_prefix}_sam_colorized.jpeg"
+    colorized_pil.save(output_path)
+
+    # Save mask overlay for reference
+    mask_visual=cv2.applyColorMap((selected_mask*255).astype(np.uint8), cv2.COLORMAP_JET)
+    overlay_path=f"{output_prefix}_sam_mask.jpeg"
+    cv2.imwrite(overlay_path, mask_visual)
+
+    print(f"✅ Saved SAM colorized image: {output_path}")
+    print(f"✅ Saved SAM mask overlay: {overlay_path}")
+
+    return output_path 
