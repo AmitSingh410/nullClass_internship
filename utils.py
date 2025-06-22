@@ -15,10 +15,18 @@ from PIL import Image
 import torchvision.models as models
 import torchvision.models.segmentation as segmentation
 from segment_anything import sam_model_registry, SamPredictor
+import glob
 
 # -----------------------------
 # Section 1: Utility Functions
 # -----------------------------
+
+def rgb_to_lab(tensor):
+    """Convert normalized tensor image [3,H,W] in range [0,1] to Lab."""
+    img = tensor.permute(1, 2, 0).cpu().numpy()  # [H,W,3]
+    lab = color.rgb2lab(img).astype(np.float32)
+    lab = torch.from_numpy(lab).permute(2, 0, 1) / torch.tensor([100.0, 128.0, 128.0]).view(3, 1, 1)
+    return lab
 
 def srgb_to_linear(img_srgb:torch.Tensor) -> torch.Tensor:
     
@@ -29,7 +37,7 @@ def srgb_to_linear(img_srgb:torch.Tensor) -> torch.Tensor:
     c_lin_high = ((img_srgb + 0.055) / 1.055) ** 2.4
     return mask * c_lin_low + (1.0 - mask) * c_lin_high
 
-def rgb_to_gray_with_clahe(img:torch.Tensor, clip_limit:float=1.5, tile_grid_size=(2, 2)) -> torch.Tensor:
+def rgb_to_gray_with_clahe(img:torch.Tensor, clip_limit:float=1.5, tile_grid_size=(8, 8)) -> torch.Tensor:
     
    
     img_lin= srgb_to_linear(img) #sRGB to linear RGB conversion
@@ -196,53 +204,57 @@ def visualize_all_three(original_images,grayscale_images,colorized_images,n=5):
 # SECTION 2: Dataset & Model
 # -----------------------------
 
-class CIFARColorizationDataset(Dataset):
-    def __init__(self,root_dir,train=True,augment=True):
-        self.augment=augment
-        
-        self.base_dataset=torchvision.datasets.CIFAR10(
-            root=root_dir,
-            train=train,
-            download=False,
-            transform=None
-        )
-        
-        self.aug_transform=transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=15,interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.ColorJitter(brightness=0.2,contrast=0.2,saturation=0.2)
+from torchvision import transforms
+from torch.utils.data import Dataset
+from PIL import Image
+import os
+import glob
+
+class CustomImageNet100Dataset(Dataset):
+    def __init__(self, root_dir, train=True, augment=True, img_size=224):
+        self.img_size = img_size
+        self.augment = augment
+
+        # Shard folders
+        if train:
+            shard_dirs = [os.path.join(root_dir, f"train.X{i}") for i in range(1, 5)]
+        else:
+            shard_dirs = [os.path.join(root_dir, "val.X")]
+
+        self.samples = []
+        for shard in shard_dirs:
+            class_dirs = glob.glob(os.path.join(shard, "*"))
+            for class_dir in class_dirs:
+                label = os.path.basename(class_dir)
+                images = glob.glob(os.path.join(class_dir, "*.JPEG"))
+                self.samples.extend([(img, label) for img in images])
+
+        self.class_to_idx = {label: idx for idx, label in enumerate(sorted(set(l for _, l in self.samples)))}
+
+        self.transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.RandomHorizontalFlip() if augment else transforms.Lambda(lambda x: x),
+            transforms.ToTensor(),
         ])
-        self.to_Tensor=transforms.ToTensor()
-    
+
     def __len__(self):
-        return len(self.base_dataset)
-    
+        return len(self.samples)
+
     def __getitem__(self, idx):
-        # 1) Get the PIL image out of the torchvision CIFAR10 dataset
-        pil_img, _ = self.base_dataset[idx]  # pil_img is 32×32 RGB (PIL Image)
-        if self.augment:
-            pil_img = self.aug_transform(pil_img)
-
-        # 2) Convert to Tensor [3×32×32] in [0,1]
-        img_rgb = self.to_Tensor(pil_img)
-
-        # 3) Compute weighted+CLAHE grayscale via gray_utils
-        gray = rgb_to_gray_with_clahe(img_rgb.unsqueeze(0)).squeeze(0)  # [1,32,32]
-
-        # 4) Convert GT PIL→NumPy→Lab and normalize
-        img_np = np.array(pil_img) / 255.0  # [32,32,3] ∈ [0,1]
-        lab = color.rgb2lab(img_np.astype(np.float32))  # L∈[0,100], a,b∈[-128,127]
-        L = lab[..., 0:1] / 100.0        # [32,32,1] ∈ [0,1]
-        ab = lab[..., 1:3] / 128.0       # [32,32,2] ∈ [-1,1]
-
-        L_t  = torch.from_numpy(L.astype(np.float32)).permute(2,0,1)   # [1,32,32]
-        ab_t = torch.from_numpy(ab.astype(np.float32)).permute(2,0,1)  # [2,32,32]
+        img_path, label = self.samples[idx]
+        image = Image.open(img_path).convert("RGB")
+        image = self.transform(image)
+        gray = transforms.functional.rgb_to_grayscale(image)
+        lab = rgb_to_lab(image)
+        L, ab = lab[0:1], lab[1:]
 
         return {
-            "gray":  gray,   # [1,32,32]
-            "L_gt":  L_t,    # [1,32,32]
-            "ab_gt": ab_t    # [2,32,32]
+            "gray": gray,
+            "L_gt": L,
+            "ab_gt": ab
         }
+
+
         
 class UNet32(nn.Module):
     def __init__(self,base_ch=64):
@@ -367,7 +379,7 @@ def targeted_colorization_with_segmentation(pil_img_path, model, gray_fn, select
 
     # Resize + tensor
     transform = transforms.Compose([
-        transforms.Resize((256, 256)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor()
     ])
     img_tensor = transform(pil_img).unsqueeze(0).to(device)
@@ -395,7 +407,7 @@ def targeted_colorization_with_segmentation(pil_img_path, model, gray_fn, select
         seg_output = seg_model(seg_input)['out']
     seg_mask = torch.argmax(seg_output.squeeze(), dim=0).cpu().numpy()
 
-    seg_mask_resized = cv2.resize(seg_mask, (256, 256), interpolation=cv2.INTER_NEAREST)
+    seg_mask_resized = cv2.resize(seg_mask, (224, 224), interpolation=cv2.INTER_NEAREST)
     seg_tensor = torch.from_numpy(seg_mask_resized).unsqueeze(0).unsqueeze(0).to(device)
     mask_tensor = torch.zeros_like(seg_tensor, dtype=torch.bool).to(device)
     for cls in selected_classes:
@@ -421,54 +433,54 @@ def targeted_colorization_with_segmentation(pil_img_path, model, gray_fn, select
 # SECTION 4: Training Loop
 # -----------------------------
 
-def train_model(model, train_loader, val_loader, device, save_path="best_cifar_unet_clahe_lab.pth", epochs=75, patience=15):
+import time  # make sure this is at the top of your file
+
+def train_model(model, train_loader, val_loader, device, save_path="best_imagenet_unet_clahe_lab.pth", epochs=75, patience=15):
     print("Using", device)
+    
     criteria = nn.L1Loss()
     vgg = models.vgg16(pretrained=True).features[:16].to(device)
     for p in vgg.parameters():
         p.requires_grad = False
-    up = nn.Upsample(scale_factor=3, mode="bilinear", align_corners=False)
+
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-5)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[20, 40, 60], gamma=0.5)
 
     best_val = float('inf')
     epochs_since_improve = 0
 
+    epoch_start_time = time.time()  # track wall clock
     for epoch in range(1, epochs + 1):
+        start_time = time.time()
         model.train()
         running_train = 0.0
 
         for batch in train_loader:
-            gray = batch['gray'].to(device)
-            L_gt = batch['L_gt'].to(device)
-            ab_gt = batch['ab_gt'].to(device)
+            gray   = batch['gray'].to(device)
+            L_gt   = batch['L_gt'].to(device)
+            ab_gt  = batch['ab_gt'].to(device)
             ab_pred = model(gray)
+
             loss_ab = criteria(ab_pred, ab_gt)
 
-            L_pred = gray * 100.0
-            ab_pred_s = ab_pred * 128.0
-            lab_pred = torch.cat([L_pred, ab_pred_s], dim=1)
-            rgb_pred32 = lab_to_rgb_torch(lab_pred)
-            rgb_pred96 = up(rgb_pred32)
+            lab_pred = torch.cat([gray * 100.0, ab_pred * 128.0], dim=1)
+            rgb_pred = lab_to_rgb_torch(lab_pred).to(device)
 
-            L_gt_full = L_gt * 100.0
-            ab_gt_s = ab_gt * 128.0
-            lab_gt = torch.cat([L_gt_full, ab_gt_s], dim=1)
-            rgb_gt32 = lab_to_rgb_torch(lab_gt)
-            rgb_gt96 = up(rgb_gt32)
+            lab_gt = torch.cat([L_gt * 100.0, ab_gt * 128.0], dim=1)
+            rgb_gt = lab_to_rgb_torch(lab_gt).to(device)
 
             mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-            rgb_pred96 = rgb_pred96.to(device)
-            rgb_gt96 = rgb_gt96.to(device)
+            std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
-            pred_norm = (rgb_pred96 - mean) / std
-            gt_norm = (rgb_gt96 - mean) / std
+            pred_norm = (rgb_pred - mean) / std
+            gt_norm   = (rgb_gt - mean) / std
+
             feat_p = vgg(pred_norm.float())
             feat_g = vgg(gt_norm.float())
             loss_perc = F.l1_loss(feat_p, feat_g)
 
             loss = loss_ab + 0.01 * loss_perc
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -476,17 +488,27 @@ def train_model(model, train_loader, val_loader, device, save_path="best_cifar_u
 
         train_avg = running_train / len(train_loader)
 
+        # --- Validation ---
         model.eval()
         running_val = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                gray_v = batch["gray"].to(device)
-                ab_gt_v = batch["ab_gt"].to(device)
+                gray_v   = batch["gray"].to(device)
+                ab_gt_v  = batch["ab_gt"].to(device)
                 ab_pred_v = model(gray_v)
                 running_val += criteria(ab_pred_v, ab_gt_v).item()
         val_avg = running_val / len(val_loader)
 
-        print(f"Epoch {epoch:>2d}/{epochs}  |  Train L1(ab): {train_avg:.4f}  |  Val L1(ab): {val_avg:.4f}  |  LR: {optimizer.param_groups[0]['lr']:.6f}")
+        # --- ETA computation ---
+        elapsed_epoch = time.time() - start_time
+        total_elapsed = time.time() - epoch_start_time
+        avg_epoch_time = total_elapsed / epoch
+        remaining_epochs = epochs - epoch
+        eta = avg_epoch_time * remaining_epochs
+        eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
+
+        # --- Logging ---
+        print(f"Epoch {epoch:>2d}/{epochs}  |  Train L1(ab): {train_avg:.4f}  |  Val L1(ab): {val_avg:.4f}  |  LR: {optimizer.param_groups[0]['lr']:.6f}  |  ETA: {eta_str}")
 
         if val_avg < best_val:
             best_val = val_avg
@@ -500,6 +522,9 @@ def train_model(model, train_loader, val_loader, device, save_path="best_cifar_u
 
         scheduler.step()
 
+
+
+
 # -----------------------------
 # SECTION 5: Model Inference
 # -----------------------------
@@ -509,7 +534,7 @@ def infer_and_save(model, image_path, device):
     to_pil = transforms.ToPILImage()
     pil_img = Image.open(image_path).convert('RGB')
     transform = transforms.Compose([
-        transforms.Resize((256, 256)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor()
     ])
     img_tensor = transform(pil_img).unsqueeze(0).to(device)
