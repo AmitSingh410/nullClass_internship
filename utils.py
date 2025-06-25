@@ -541,6 +541,7 @@ def train_model(model, train_loader, val_loader, device, save_path="checkpoint_i
         with torch.no_grad():
             for i, batch in enumerate(tqdm(val_loader, desc="Validating", leave=False)):
                 try:
+                    batch=batch.to(device)
                     _, gray_v, lab_v = _gpu_tfm(batch)
                     ab_gt_v = lab_v[:, 1:]
                     ab_pred_v = model(gray_v)
