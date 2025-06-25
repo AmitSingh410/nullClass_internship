@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torchvision
+from torchvision.io import read_image
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader,Dataset,random_split
 from skimage import color
@@ -16,10 +17,39 @@ import torchvision.models as models
 import torchvision.models.segmentation as segmentation
 from segment_anything import sam_model_registry, SamPredictor
 import glob
+import kornia as K
+from torch.amp import autocast,GradScaler   
+
 
 # -----------------------------
 # Section 1: Utility Functions
 # -----------------------------
+
+class GPUTransform:
+    def __init__(self, img_size=224):
+        self.resize = K.geometry.Resize((img_size, img_size), interpolation='bilinear')
+        self.rgb2gray= K.color.RgbToGrayscale()
+        self.rgb2lab = K.color.RgbToLab()    # returns L∈[0,100], a/b∼[-110,110]
+    def __call__(self, img_cpu):
+    # img_cpu: [B,3,H,W] or [3,H,W]
+        single = False
+        if img_cpu.dim() == 3:
+            img_cpu = img_cpu.unsqueeze(0)
+            single = True
+
+        img = img_cpu.float()        # [B,3,H,W]
+        img = self.resize(img)
+        gray = self.rgb2gray(img)                      # [B,1,H,W]
+        gray = K.enhance.equalize_clahe(gray, grid_size=(8,8), clip_limit=1.5)
+        lab  = self.rgb2lab(img)                       # [B,3,H,W]
+        lab_norm = torch.cat([lab[:,0:1]/100.0, lab[:,1:]/110.0], dim=1)
+
+        return img, gray, lab_norm if not single else lab_norm.squeeze(0)
+
+_gpu_tfm = GPUTransform(img_size=224)
+
+
+
 
 def rgb_to_lab(tensor):
     """Convert normalized tensor image [3,H,W] in range [0,1] to Lab."""
@@ -36,23 +66,6 @@ def srgb_to_linear(img_srgb:torch.Tensor) -> torch.Tensor:
     c_lin_low= img_srgb / 12.92
     c_lin_high = ((img_srgb + 0.055) / 1.055) ** 2.4
     return mask * c_lin_low + (1.0 - mask) * c_lin_high
-
-def rgb_to_gray_with_clahe(img:torch.Tensor, clip_limit:float=1.5, tile_grid_size=(8, 8)) -> torch.Tensor:
-    
-   
-    img_lin= srgb_to_linear(img) #sRGB to linear RGB conversion
-    weights=torch.tensor([0.299, 0.587, 0.114], device=img_lin.device, dtype=img_lin.dtype).view(1, 3, 1, 1)
-    y = (img_lin * weights).sum(dim=1, keepdim=True)  # [B,1,H,W]
-    
-    out=[]
-    for b in range(y.size(0)):
-        y_np=(y[b,0].cpu().numpy()*255).astype(np.uint8)  # Convert to [0,255] for OpenCV
-        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
-        y_eq = clahe.apply(y_np)
-        y_eq_t=torch.from_numpy(y_eq.astype(np.float32) / 255.0)
-        out.append(y_eq_t.unsqueeze(0))
-    out=torch.stack(out, dim=0)
-    return out.to(img.device)
 
 def lab_to_rgb_torch(lab_tensor):
     
@@ -231,28 +244,22 @@ class CustomImageNet100Dataset(Dataset):
 
         self.class_to_idx = {label: idx for idx, label in enumerate(sorted(set(l for _, l in self.samples)))}
 
-        self.transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.RandomHorizontalFlip() if augment else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-        ])
-
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-        image = Image.open(img_path).convert("RGB")
-        image = self.transform(image)
-        gray = transforms.functional.rgb_to_grayscale(image)
-        lab = rgb_to_lab(image)
-        L, ab = lab[0:1], lab[1:]
-
-        return {
-            "gray": gray,
-            "L_gt": L,
-            "ab_gt": ab
-        }
+        img_path, _ = self.samples[idx]
+        img = Image.open(img_path).convert("RGB")  # 🔥 ensures always 3-channel
+        img = transforms.ToTensor()(img)           # [3, H, W] in [0,1]
+  # [C, H, W], C could be 1 or 3
+        if img.shape[0] == 1:
+            img = img.expand(3, -1, -1)  # Convert grayscale to 3 channels
+        img = img.float() / 255.0
+        img = K.geometry.Resize((self.img_size, self.img_size), interpolation='bilinear')(img.unsqueeze(0)).squeeze(0)
+        if self.augment:
+            img = K.augmentation.RandomHorizontalFlip()(img.unsqueeze(0)).squeeze(0)
+        
+        return img
 
 
         
@@ -385,7 +392,8 @@ def targeted_colorization_with_segmentation(pil_img_path, model, gray_fn, select
     img_tensor = transform(pil_img).unsqueeze(0).to(device)
 
     # Grayscale
-    gray_tensor = gray_fn(img_tensor)
+    _, gray_tensor, _ = _gpu_tfm(img_tensor.cpu())
+
 
     # Colorization
     model.eval()
@@ -435,92 +443,147 @@ def targeted_colorization_with_segmentation(pil_img_path, model, gray_fn, select
 
 import time  # make sure this is at the top of your file
 
-def train_model(model, train_loader, val_loader, device, save_path="best_imagenet_unet_clahe_lab.pth", epochs=75, patience=15):
+import warnings
+import time
+from tqdm import tqdm
+
+import warnings
+import time
+from tqdm import tqdm
+
+def train_model(model, train_loader, val_loader, device, save_path="checkpoint_imagenet_unet_clahe_lab.pth", epochs=75, patience=15):
     print("Using", device)
-    
+
     criteria = nn.L1Loss()
-    vgg = models.vgg16(pretrained=True).features[:16].to(device)
+    vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features[:16].to(device)
     for p in vgg.parameters():
         p.requires_grad = False
 
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-5)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[20, 40, 60], gamma=0.5)
+    scaler = GradScaler("cuda")
 
-    best_val = float('inf')
+    start_epoch = 1
     epochs_since_improve = 0
+    epoch_start_time = time.time()
 
-    epoch_start_time = time.time()  # track wall clock
-    for epoch in range(1, epochs + 1):
-        start_time = time.time()
+    # Resume logic
+    if os.path.exists(save_path):
+        print(f"🔄 Resuming from checkpoint: {save_path}")
+        checkpoint = torch.load(save_path, map_location=device)
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        scaler.load_state_dict(checkpoint['scaler'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val = checkpoint['best_val']
+    else:
+        best_val = float('inf')
+
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         running_train = 0.0
+        start_time = time.time()
 
-        for batch in train_loader:
-            gray   = batch['gray'].to(device)
-            L_gt   = batch['L_gt'].to(device)
-            ab_gt  = batch['ab_gt'].to(device)
-            ab_pred = model(gray)
+        print(f"\n🔁 Epoch {epoch}/{epochs} [Training]")
+        for i, batch in enumerate(tqdm(train_loader, desc="Loading Batches", leave=True)):
+            try:
+                batch = batch.to(device,non_blocking=True)
+                _, gray, lab = _gpu_tfm(batch)   # All on GPU
+                L_gt  = lab[:, 0:1]              # [B,1,H,W]
+                ab_gt = lab[:, 1:]               # [B,2,H,W]
 
-            loss_ab = criteria(ab_pred, ab_gt)
+                with autocast("cuda"):
+                    ab_pred = model(gray)
+                    ab_pred = torch.clamp(ab_pred, -1.0, 1.0)
+                    loss_ab = criteria(ab_pred, ab_gt)
 
-            lab_pred = torch.cat([gray * 100.0, ab_pred * 128.0], dim=1)
-            rgb_pred = lab_to_rgb_torch(lab_pred).to(device)
+                    lab_pred = torch.cat([gray * 100.0, ab_pred * 128.0], dim=1)
+                    lab_gt   = torch.cat([L_gt * 100.0, ab_gt * 128.0], dim=1)
 
-            lab_gt = torch.cat([L_gt * 100.0, ab_gt * 128.0], dim=1)
-            rgb_gt = lab_to_rgb_torch(lab_gt).to(device)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        rgb_pred = lab_to_rgb_torch(lab_pred).to(device)
+                        rgb_gt   = lab_to_rgb_torch(lab_gt).to(device)
 
-            mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-            std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+                    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
-            pred_norm = (rgb_pred - mean) / std
-            gt_norm   = (rgb_gt - mean) / std
+                    rgb_pred_small = F.interpolate(rgb_pred, size=(112, 112), mode="bilinear", align_corners=False)
+                    rgb_gt_small   = F.interpolate(rgb_gt,   size=(112, 112), mode="bilinear", align_corners=False)
 
-            feat_p = vgg(pred_norm.float())
-            feat_g = vgg(gt_norm.float())
-            loss_perc = F.l1_loss(feat_p, feat_g)
+                    pred_norm = (rgb_pred_small - mean) / std
+                    gt_norm   = (rgb_gt_small - mean) / std
 
-            loss = loss_ab + 0.01 * loss_perc
+                    feat_p = vgg(pred_norm.float())
+                    feat_g = vgg(gt_norm.float())
+                    loss_perc = F.l1_loss(feat_p, feat_g)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            running_train += loss.item()
+                    loss = loss_ab + 0.01 * loss_perc
+
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                running_train += loss.item()
+
+            except Exception as e:
+                print(f"❌ Error in batch {i}: {e}")
+                continue
 
         train_avg = running_train / len(train_loader)
 
-        # --- Validation ---
+        # ------------------- VALIDATION -------------------
         model.eval()
         running_val = 0.0
+        print(f"\n🔍 Epoch {epoch}/{epochs} [Validation]")
         with torch.no_grad():
-            for batch in val_loader:
-                gray_v   = batch["gray"].to(device)
-                ab_gt_v  = batch["ab_gt"].to(device)
-                ab_pred_v = model(gray_v)
-                running_val += criteria(ab_pred_v, ab_gt_v).item()
+            for i, batch in enumerate(tqdm(val_loader, desc="Validating", leave=False)):
+                try:
+                    _, gray_v, lab_v = _gpu_tfm(batch)
+                    ab_gt_v = lab_v[:, 1:]
+                    ab_pred_v = model(gray_v)
+                    running_val += criteria(ab_pred_v, ab_gt_v).item()
+                except Exception as e:
+                    print(f"❌ Error in validation batch {i}: {e}")
+                    continue
+
         val_avg = running_val / len(val_loader)
 
-        # --- ETA computation ---
+        # ------------------- ETA -------------------
         elapsed_epoch = time.time() - start_time
         total_elapsed = time.time() - epoch_start_time
-        avg_epoch_time = total_elapsed / epoch
-        remaining_epochs = epochs - epoch
-        eta = avg_epoch_time * remaining_epochs
+        avg_epoch_time = total_elapsed / (epoch - start_epoch + 1)
+        eta = avg_epoch_time * (epochs - epoch)
         eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
 
-        # --- Logging ---
-        print(f"Epoch {epoch:>2d}/{epochs}  |  Train L1(ab): {train_avg:.4f}  |  Val L1(ab): {val_avg:.4f}  |  LR: {optimizer.param_groups[0]['lr']:.6f}  |  ETA: {eta_str}")
+        # ------------------- LOG -------------------
+        print(f"\n📊 Epoch {epoch:>2d}/{epochs} | Train L1(ab): {train_avg:.4f} | Val L1(ab): {val_avg:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f} | ETA: {eta_str}")
 
         if val_avg < best_val:
             best_val = val_avg
-            torch.save(model.state_dict(), save_path)
+            torch.save({
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
+                'epoch': epoch,
+                'best_val': best_val
+            }, save_path)
+            print(f"✅ Saved best model to: {save_path}")
             epochs_since_improve = 0
         else:
             epochs_since_improve += 1
+            print(f"⚠️ No improvement for {epochs_since_improve} epoch(s).")
             if epochs_since_improve >= patience:
-                print(f"Early stopping at epoch {epoch} (no improvement for {patience} epochs).")
+                print(f"⏹️ Early stopping at epoch {epoch} (no improvement for {patience} epochs).")
                 break
 
         scheduler.step()
+
+
+
 
 
 
@@ -538,7 +601,7 @@ def infer_and_save(model, image_path, device):
         transforms.ToTensor()
     ])
     img_tensor = transform(pil_img).unsqueeze(0).to(device)
-    gray_tensor = rgb_to_gray_with_clahe(img_tensor)
+    _, gray_tensor, _ = _gpu_tfm(img_tensor.cpu())
     model.eval()
     with torch.no_grad():
         pred_ab = model(gray_tensor)
@@ -598,7 +661,7 @@ def sam_targeted_colorization(
     img_tensor=transform(pil_img).unsqueeze(0).to(device)
 
     # Convert to grayscale
-    gray_tensor = rgb_to_gray_with_clahe(img_tensor)
+    _, gray_tensor, _ = _gpu_tfm(img_tensor.cpu())
 
     # Predict ab channels
     model.eval()
